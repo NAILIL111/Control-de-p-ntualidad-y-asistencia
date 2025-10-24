@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registro ST2 — catálogo desde Google Sheets (editable)</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+  h1 { font-size: 20px; margin-bottom: 12px; }
+  .meta { color: #555; margin-bottom: 16px; }
+  .toolbar { display:flex; gap:8px; margin-bottom: 12px; flex-wrap: wrap; align-items:center; }
+  .search { padding:8px 10px; border:1px solid #e5e7eb; border-radius:8px; width: min(360px, 100%); }
+  button { padding:8px 12px; border:1px solid #e5e7eb; background:#fff; border-radius:8px; cursor:pointer; }
+  button:hover { background:#f9fafb; }
+  .status { font-size:12px; margin-left: 6px; }
+  .ok { color:#166534; }
+  .warn { color:#92400e; }
+  .err { color:#991b1b; }
+  .wrap { display:grid; gap:20px; }
+  .card { border:1px solid #e5e7eb; border-radius:12px; padding:14px; }
+  .card h2 { font-size:16px; margin:0 0 10px; }
+  .table-wrap { overflow:auto; border:1px solid #e5e7eb; border-radius:10px; }
+  table { border-collapse: collapse; width: 100%; min-width: 980px; }
+  thead th {
+    position: sticky; top: 0; background:#f8fafc; z-index:1;
+    text-align: left; font-weight: 600; font-size: 13px; color:#111827; border-bottom:1px solid #e5e7eb; padding:10px;
+  }
+  tbody td { border-bottom: 1px solid #f1f5f9; padding: 8px 10px; font-size: 13px; }
+  tbody tr:hover { background:#f8fafc; }
+  input[type="date"], input[type="time"], select, input[type="text"] { padding:6px 8px; border:1px solid #e5e7eb; border-radius:6px; }
+  .yes { background:#dcfce7; color:#166534; padding:3px 8px; border-radius:999px; display:inline-block; }
+  .no  { background:#fee2e2; color:#991b1b; padding:3px 8px; border-radius:999px; display:inline-block; }
+  .muted { color:#6b7280; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>Registro ST2 — catálogo desde Google Sheets (editable)</h1>
+  <div class="meta">Generado: <!-- fecha local --></div>
+
+  <div class="wrap">
+    <div class="card">
+      <h2>1) Captura diaria</h2>
+      <div class="toolbar">
+        <input id="q" class="search" placeholder="Buscar en registros…" oninput="filterRows()">
+        <button onclick="addRow()">Agregar fila</button>
+        <button onclick="saveLocal()">Guardar local</button>
+        <button onclick="syncNow()">Sincronizar a Google Sheets</button>
+        <span id="syncStatus" class="status"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="tabla">
+          <thead>
+            <tr>
+              <th>Fecha</th>
+              <th>Semana</th>
+              <th>Nombre</th>
+              <th>Área</th>
+              <th>Horario programado</th>
+              <th>Hora registrada</th>
+              <th>Minutos tardanza</th>
+              <th>Cumple</th>
+              <th>Observaciones</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="muted">Consejo: se guarda automáticamente al editar. Si no hay internet, los envíos quedan en cola.</div>
+    </div>
+
+    <div class="card">
+      <h2>2) Catálogo de personal (Nombre → Área, Horario)</h2>
+      <div class="toolbar" style="gap:10px; flex-wrap:wrap;">
+        <button onclick="reloadCatalog()">Recargar catálogo</button>
+        <button onclick="addCatalogRow()">Agregar persona</button>
+        <button onclick="saveCatalog()">Guardar catálogo en Sheets</button>
+        <label style="display:inline-flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="deleteMissing"> Eliminar ausentes
+        </label>
+        <button onclick="applyCatalogToCapture()">Aplicar catálogo a la tabla de captura</button>
+        <span id="catStatus" class="status"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="catTable">
+          <thead>
+            <tr>
+              <th>Nombre</th>
+              <th>Área</th>
+              <th>Horario</th>
+              <th>—</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="muted">* Guardar catálogo hace <b>upsert por Nombre</b>; si marcas “Eliminar ausentes”, también borra los que no estén en el envío.</div>
+    </div>
+  </div>
+
+<script>
+  // ====== CONFIGURA AQUÍ ======
+  const ENDPOINT_URL = "PASTE_YOUR_WEBAPP_URL_HERE"; // <— pega aquí tu Web App URL (Apps Script)
+  const API_KEY = ""; // opcional; si lo usas, pon el mismo valor en Apps Script
+  // ============================
+
+  const STORAGE_KEY = 'st2_registros';
+  const QUEUE_KEY = 'st2_queue';
+  let CATALOGO = {}; // nombre -> { area, horario }
+
+  // Utilidades UI
+  function setStatus(id, msg, cls) {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.className = 'status ' + (cls||'');
+    el.textContent = msg;
+  }
+
+  // ---- Captura diaria ----
+  function filterRows() {
+    const q = document.getElementById('q').value.toLowerCase();
+    document.querySelectorAll('#tabla tbody tr').forEach(tr => {
+      tr.style.display = tr.innerText.toLowerCase().includes(q) ? '' : 'none';
+    });
+  }
+  function isoWeek(d) {
+    const date = new Date(d.getTime());
+    date.setHours(0,0,0,0);
+    date.setDate(date.getDate() + 3 - (date.getDay() + 6) % 7);
+    const week1 = new Date(date.getFullYear(),0,4);
+    return 1 + Math.round(((date - week1) / 86400000 - 3 + (week1.getDay() + 6)%7) / 7);
+  }
+  function timeToMinutes(t){
+    if(!t) return null;
+    const [h,m] = t.split(':').map(x=>parseInt(x,10));
+    if(Number.isNaN(h) || Number.isNaN(m)) return null;
+    return h*60 + m;
+  }
+  function recalc(tr){
+    const fecha = tr.querySelector('input[type="date"]').value;
+    tr.children[1].textContent = '';
+    if(fecha) { const d = new Date(fecha); if(!isNaN(d)) tr.children[1].textContent = isoWeek(d); }
+    const horario = tr.children[4].textContent.trim();
+    const reg = tr.querySelector('input[type="time"]').value;
+    const prog = timeToMinutes(horario);
+    const rmin = timeToMinutes(reg);
+    let tard = '';
+    if(prog != null && rmin != null) tard = Math.max(0, rmin - prog);
+    tr.children[6].textContent = tard;
+    tr.children[7].innerHTML = (tard === '' ? '' : (tard === 0 ? '<span class="yes">Sí</span>' : '<span class="no">No</span>'));
+  }
+  function onNombreChange(sel){
+    const tr = sel.closest('tr');
+    const nombre = sel.value;
+    const item = CATALOGO[nombre];
+    if(item){
+      tr.children[3].textContent = item.area || '';
+      tr.children[4].textContent = item.horario || '08:00';
+    } else {
+      tr.children[3].textContent = '';
+      tr.children[4].textContent = '08:00';
+    }
+    recalc(tr);
+    autoSave();
+  }
+  function buildNombreSelect(value) {
+    const sel = document.createElement('select');
+    sel.innerHTML = '<option value="">-- Selecciona --</option>' +
+      Object.keys(CATALOGO).sort().map(n => '<option value="'+n.replaceAll('"','&quot;')+'">'+n+'</option>').join('');
+    if(value) sel.value = value;
+    sel.onchange = function() { onNombreChange(sel); };
+    return sel;
+  }
+  function addRow(values=null) {
+    const tb = document.querySelector('#tabla tbody');
+    const v = values || {fecha:'', semana:'', nombre:'', area:'', horario:'08:00', hora:'', obs:''};
+    const tr = document.createElement('tr');
+
+    const tdFecha = document.createElement('td');
+    const inputFecha = document.createElement('input');
+    inputFecha.type = 'date'; inputFecha.value = v.fecha || '';
+    inputFecha.onchange = () => { recalc(tr); autoSave(); };
+    tdFecha.appendChild(inputFecha);
+
+    const tdSemana = document.createElement('td'); tdSemana.textContent = v.semana || '';
+
+    const tdNombre = document.createElement('td');
+    const sel = buildNombreSelect(v.nombre || '');
+    tdNombre.appendChild(sel);
+
+    const tdArea = document.createElement('td'); tdArea.textContent = v.area || '';
+    const tdHorario = document.createElement('td'); tdHorario.textContent = v.horario || '08:00';
+
+    const tdHora = document.createElement('td');
+    const inputHora = document.createElement('input');
+    inputHora.type = 'time'; inputHora.step = 60; inputHora.value = v.hora || '';
+    inputHora.oninput = () => { recalc(tr); autoSave(); };
+    tdHora.appendChild(inputHora);
+
+    const tdTard = document.createElement('td');
+    const tdCumple = document.createElement('td');
+    const tdObs = document.createElement('td'); tdObs.contentEditable = 'true'; tdObs.textContent = v.obs || '';
+    tdObs.oninput = autoSave;
+
+    tr.append(tdFecha, tdSemana, tdNombre, tdArea, tdHorario, tdHora, tdTard, tdCumple, tdObs);
+    tb.appendChild(tr);
+
+    if(v.nombre) onNombreChange(sel);
+    recalc(tr);
+  }
+  function tableToData(){
+    const rows = Array.from(document.querySelectorAll('#tabla tbody tr'));
+    return rows.map(r => ({ 
+      fecha: r.querySelector('input[type="date"]').value || '',
+      semana: r.children[1].innerText.trim(),
+      nombre: r.querySelector('select').value || '',
+      area: r.children[3].innerText.trim(),
+      horario: r.children[4].innerText.trim(),
+      hora: r.querySelector('input[type="time"]').value || '',
+      tardanza: r.children[6].innerText.trim(),
+      cumple: r.children[7].innerText.includes('Sí') ? 'Sí' : (r.children[7].innerText.includes('No') ? 'No' : ''),
+      obs: r.children[8].innerText.trim()
+    }));
+  }
+  function saveLocal(){
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(tableToData()));
+    setStatus('syncStatus','Guardado local.','ok');
+  }
+  function autoSave(){
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(tableToData()));
+  }
+  function loadLocal(){
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return false;
+    let data=[]; try { data = JSON.parse(raw) } catch(e) { return false; }
+    const tb = document.querySelector('#tabla tbody');
+    tb.innerHTML='';
+    data.forEach(v => addRow(v));
+    return true;
+  }
+  function enqueueForSync(rows){
+    const raw = localStorage.getItem(QUEUE_KEY);
+    let q = []; try { q = raw ? JSON.parse(raw) : [] } catch(e) { q = []; }
+    q.push(...rows);
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  }
+  async function syncNow(){
+    const data = tableToData();
+    const rows = data.filter(r => r.fecha && r.nombre);
+    if(!rows.length) { setStatus('syncStatus','No hay filas con Fecha y Nombre para enviar.','warn'); return; }
+    enqueueForSync(rows);
+    await flushQueue();
+  }
+  async function flushQueue(){
+    const raw = localStorage.getItem(QUEUE_KEY);
+    let q = []; try { q = raw ? JSON.parse(raw) : [] } catch(e) { q = []; }
+    if(!q.length) { setStatus('syncStatus','Sin pendientes de sincronizar.','ok'); return; }
+    if(!ENDPOINT_URL || ENDPOINT_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') { setStatus('syncStatus','Configura ENDPOINT_URL.','err'); return; }
+    try {
+      setStatus('syncStatus','Enviando ' + q.length + ' fila(s)…','warn');
+      const res = await fetch(ENDPOINT_URL + '?op=insert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: API_KEY, rows: q })
+      });
+      const json = await res.json();
+      if(json && json.ok) {
+        localStorage.removeItem(QUEUE_KEY);
+        setStatus('syncStatus','Sincronizado (' + (json.inserted||q.length) + ' fila(s)).','ok');
+      } else {
+        setStatus('syncStatus','Error de servidor: ' + (json && json.error ? json.error : 'desconocido'),'err');
+      }
+    } catch(e) {
+      setStatus('syncStatus','Sin conexión o error de envío. Quedó en cola.','err');
+    }
+  }
+
+  // ---- Editor de catálogo ----
+  function renderCatalogTable() {
+    const tb = document.querySelector('#catTable tbody');
+    tb.innerHTML = '';
+    const nombres = Object.keys(CATALOGO).sort();
+    nombres.forEach(n => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><input type="text" value="${n}" data-field="nombre"></td>
+        <td><input type="text" value="${(CATALOGO[n].area || '')}" data-field="area"></td>
+        <td><input type="text" value="${(CATALOGO[n].horario || '08:00')}" data-field="horario"></td>
+        <td><button onclick="deleteCatalogRow(this)">Eliminar</button></td>
+      `;
+      tb.appendChild(tr);
+    });
+  }
+  function addCatalogRow() {
+    const tb = document.querySelector('#catTable tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="text" value="" placeholder="Nombre" data-field="nombre"></td>
+      <td><input type="text" value="" placeholder="Área" data-field="area"></td>
+      <td><input type="text" value="08:00" placeholder="Horario" data-field="horario"></td>
+      <td><button onclick="deleteCatalogRow(this)">Eliminar</button></td>
+    `;
+    tb.appendChild(tr);
+  }
+  function deleteCatalogRow(btn) {
+    const tr = btn.closest('tr');
+    tr.remove();
+  }
+  function readCatalogFromEditor() {
+    const rows = Array.from(document.querySelectorAll('#catTable tbody tr'));
+    const list = [];
+    rows.forEach(r => {
+      const nombre = r.querySelector('input[data-field="nombre"]').value.trim();
+      const area = r.querySelector('input[data-field="area"]').value.trim();
+      const horario = r.querySelector('input[data-field="horario"]').value.trim();
+      if(nombre) list.push({ nombre, area, horario });
+    });
+    return list;
+  }
+  function applyCatalogToCapture() {
+    const list = readCatalogFromEditor();
+    CATALOGO = {};
+    list.forEach(row => { CATALOGO[row.nombre] = { area: row.area || '', horario: row.horario || '08:00' }; });
+    document.querySelectorAll('#tabla tbody tr').forEach(tr => {
+      const selOld = tr.querySelector('select');
+      const nombreActual = selOld ? selOld.value : '';
+      if(selOld) {
+        const selNew = buildNombreSelect(nombreActual);
+        selOld.replaceWith(selNew);
+        onNombreChange(selNew);
+      }
+    });
+    setStatus('catStatus','Catálogo aplicado a la captura.','ok');
+  }
+  async function saveCatalog() {
+    const list = readCatalogFromEditor();
+    if(!list.length && !document.getElementById('deleteMissing')?.checked) {
+      setStatus('catStatus','No hay filas de catálogo para enviar.','warn'); return;
+    }
+    if(!ENDPOINT_URL || ENDPOINT_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') { setStatus('catStatus','Configura ENDPOINT_URL.','err'); return; }
+
+    const deleteMissing = !!document.getElementById('deleteMissing')?.checked;
+
+    try {
+      setStatus('catStatus','Guardando catálogo…','warn');
+      const res = await fetch(ENDPOINT_URL + '?op=upsertCatalog&deleteMissing=' + (deleteMissing ? '1' : '0'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: API_KEY, catalog: list, deleteMissing })
+      });
+      const json = await res.json();
+      if(json && json.ok) {
+        // reconstruye el CATALOGO local con lo enviado
+        CATALOGO = {};
+        list.forEach(row => { CATALOGO[row.nombre] = { area: row.area || '', horario: row.horario || '08:00' }; });
+        setStatus('catStatus',
+          `Catálogo guardado. (updates: ${json.updates||0}, inserts: ${json.inserts||0}${json.deletes!=null?`, deletes: ${json.deletes}`:''})`, 'ok');
+      } else {
+        setStatus('catStatus','Error guardando: ' + (json && json.error ? json.error : 'desconocido'),'err');
+      }
+    } catch(e) {
+      setStatus('catStatus','Fallo de red al guardar.','err');
+    }
+  }
+  async function fetchCatalog() {
+    if(!ENDPOINT_URL || ENDPOINT_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') { setStatus('catStatus','Configura ENDPOINT_URL.','err'); return; }
+    try {
+      setStatus('catStatus','Cargando catálogo…','warn');
+      const res = await fetch(ENDPOINT_URL + '?op=catalog', { method: 'GET' });
+      const json = await res.json();
+      if(json && json.ok && Array.isArray(json.catalog)) {
+        CATALOGO = {};
+        json.catalog.forEach(row => {
+          if(row && row.nombre) CATALOGO[row.nombre] = { area: row.area || '', horario: row.horario || '08:00' };
+        });
+        setStatus('catStatus','Catálogo cargado (' + Object.keys(CATALOGO).length + ' nombres).','ok');
+        renderCatalogTable();
+        const tb = document.querySelector('#tabla tbody');
+        if(tb.children.length === 0) {
+          Object.keys(CATALOGO).forEach(n => addRow({ nombre:n, area: CATALOGO[n].area, horario: CATALOGO[n].horario }));
+        } else {
+          document.querySelectorAll('#tabla tbody tr select').forEach(sel => {
+            const current = sel.value;
+            sel.replaceWith(buildNombreSelect(current));
+          });
+        }
+      } else {
+        setStatus('catStatus','Respuesta inválida del servidor.','err');
+      }
+    } catch(e) {
+      setStatus('catStatus','No se pudo cargar el catálogo.','err');
+    }
+  }
+  function reloadCatalog(){ fetchCatalog(); }
+
+  // Init
+  document.addEventListener('DOMContentLoaded', ()=>{
+    // fecha en cabecera
+    document.querySelector('.meta').textContent = 'Generado: ' + (new Date()).toISOString().slice(0,10);
+    fetchCatalog();    // carga catálogo desde Sheets
+    loadLocal();       // carga registros locales (si existen)
+    flushQueue();      // intenta enviar pendientes
+  });
+</script>
+</body>
+</html>
